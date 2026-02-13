@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────
+# dbt Project Configuration
+# NYC CRE Investment Analytics
+# ─────────────────────────────────────────────────────────
+# In production, these models run against BigQuery with
+# dbt-bigquery adapter for ELT orchestration.
+# ─────────────────────────────────────────────────────────
+
+name: 'nyc_cre_analytics'
+version: '1.0.0'
+config-version: 2
+
+profile: 'nyc_cre_analytics'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  nyc_cre_analytics:
+    staging:
+      +materialized: view
+      +schema: staging
+      +tags: ['staging']
+    intermediate:
+      +materialized: table
+      +schema: intermediate
+      +tags: ['intermediate']
+    marts:
+      +materialized: table
+      +schema: marts
+      +tags: ['marts']
+
+vars:
+  min_sale_price: 100000
+  lookback_years: 5
+  commercial_land_use_codes: ['02', '03', '04', '05', '06', '07', '08', '09', '10', '11']
