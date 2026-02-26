@@ -23,8 +23,10 @@ from config import (
     NYC_OPENDATA_DOMAIN,
     NYC_APP_TOKEN,
     DATASETS,
+    DATA_FETCH_LIMITS,
     FRED_API_KEY,
     FRED_SERIES,
+    MACRO_START_DATE,
     BOROUGH_CODES,
     DATA_RAW,
 )
@@ -240,12 +242,7 @@ class NYCOpenDataClient:
 
     def fetch_all(self, limits: Optional[dict] = None) -> dict[str, pd.DataFrame]:
         """Fetch all CRE-relevant datasets and return as a dict."""
-        defaults = {
-            "pluto": 50000,
-            "rolling_sales": 50000,
-            "dob_permits": 30000,
-            "hpd_violations": 30000,
-        }
+        defaults = DATA_FETCH_LIMITS
         limits = {**defaults, **(limits or {})}
 
         data = {}
@@ -302,7 +299,7 @@ class FREDClient:
             return self._synthetic_series(series_id, start_date, end_date)
 
     def fetch_all_macro(
-        self, start_date: str = "2010-01-01"
+        self, start_date: str = MACRO_START_DATE
     ) -> pd.DataFrame:
         """Fetch all configured macroeconomic series into a single DataFrame."""
         series_dict = {}

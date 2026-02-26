@@ -294,12 +294,14 @@ class MonteCarloSimulator:
             "risk_metrics": {
                 "var_95": initial_portfolio - np.percentile(terminal_portfolio, 5),
                 "prob_loss": (terminal_portfolio < initial_portfolio).mean(),
-                "diversification_benefit": (
-                    sum(all_paths[i, :, -1].std() for i in range(n_properties))
-                    - terminal_portfolio.std()
-                ) / sum(all_paths[i, :, -1].std() for i in range(n_properties)),
+                "diversification_benefit": 0.0,
             },
         }
+        total_std = sum(all_paths[i, :, -1].std() for i in range(n_properties))
+        if total_std > 0:
+            self.results["portfolio_simulation"]["risk_metrics"]["diversification_benefit"] = (
+                total_std - terminal_portfolio.std()
+            ) / total_std
 
         logger.info(
             f"Portfolio simulation: {n_properties} properties, "

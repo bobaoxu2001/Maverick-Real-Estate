@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 from loguru import logger
 import pandas as pd
-import numpy as np
 import sys
 
 # Configure logging
@@ -35,19 +34,53 @@ logger.add("reports/pipeline.log", level="DEBUG", rotation="10 MB")
 
 # Project imports
 sys.path.insert(0, str(Path(__file__).parent))
-from config import DATA_RAW, DATA_PROCESSED, MODEL_ARTIFACTS
+from config import (
+    DATA_RAW,
+    DATA_PROCESSED,
+    MODEL_ARTIFACTS,
+    DATA_FETCH_LIMITS,
+    DATA_SCALE_PROFILES,
+    DEFAULT_DATA_SCALE,
+    DEMO_SAMPLE_SIZE,
+)
 
 
-def step_acquire(use_demo: bool = False):
+def _resolve_fetch_limits(
+    data_scale: str,
+    limit_pluto: int | None = None,
+    limit_sales: int | None = None,
+    limit_permits: int | None = None,
+    limit_violations: int | None = None,
+) -> dict:
+    """Resolve effective data limits from profile + optional overrides."""
+    base_limits = DATA_SCALE_PROFILES.get(data_scale, DATA_FETCH_LIMITS).copy()
+
+    overrides = {
+        "pluto": limit_pluto,
+        "rolling_sales": limit_sales,
+        "dob_permits": limit_permits,
+        "hpd_violations": limit_violations,
+    }
+    for key, value in overrides.items():
+        if value is not None and value > 0:
+            base_limits[key] = value
+    return base_limits
+
+
+def step_acquire(
+    use_demo: bool = False,
+    fetch_limits: dict | None = None,
+    demo_size: int = DEMO_SAMPLE_SIZE,
+):
     """Step 1: Data Acquisition from APIs."""
     logger.info("=" * 60)
     logger.info("STEP 1: DATA ACQUISITION")
     logger.info("=" * 60)
 
     if use_demo:
-        logger.info("Using demo data (no API calls)")
+        logger.info(f"Using demo data (no API calls, sample size={demo_size:,})")
         from app.dashboard import generate_demo_data
-        data = generate_demo_data()
+        data = generate_demo_data(n=demo_size)
         for name, df in data.items():
             path = DATA_RAW / f"{name}.parquet"
             df.to_parquet(path, index=isinstance(df.index, pd.DatetimeIndex))
@@ -59,12 +92,9 @@ def step_acquire(use_demo: bool = False):
     # NYC Open Data
     logger.info("Fetching NYC Open Data...")
     nyc_client = NYCOpenDataClient()
-    nyc_data = nyc_client.fetch_all(limits={
-        "pluto": 50000,
-        "rolling_sales": 50000,
-        "dob_permits": 30000,
-        "hpd_violations": 30000,
-    })
+    fetch_limits = fetch_limits or DATA_FETCH_LIMITS
+    logger.info(f"Using fetch limits: {fetch_limits}")
+    nyc_data = nyc_client.fetch_all(limits=fetch_limits)
 
     # FRED Macroeconomic Data
     logger.info("Fetching FRED macroeconomic data...")
@@ -103,15 +133,29 @@ def step_features(elt_data: dict = None):
     from src.feature_engineering import engineer_features
 
     # Load data
+    pluto = pd.DataFrame()
+    sales = pd.DataFrame()
+    permits = None
+    violations = None
+
     if elt_data is None:
         prop_path = DATA_PROCESSED / "property_valuations.parquet"
         if prop_path.exists():
-            return pd.read_parquet(prop_path)
-
-    pluto = elt_data.get("staging", {}).get("pluto", pd.DataFrame())
-    sales = elt_data.get("property_valuations", pd.DataFrame())
-    permits = elt_data.get("staging", {}).get("permits", None)
-    violations = elt_data.get("staging", {}).get("violations", None)
+            sales = pd.read_parquet(prop_path)
+        pluto_path = DATA_PROCESSED / "staging_pluto.parquet"
+        if pluto_path.exists():
+            pluto = pd.read_parquet(pluto_path)
+        permits_path = DATA_PROCESSED / "staging_permits.parquet"
+        if permits_path.exists():
+            permits = pd.read_parquet(permits_path)
+        violations_path = DATA_PROCESSED / "staging_violations.parquet"
+        if violations_path.exists():
+            violations = pd.read_parquet(violations_path)
+    else:
+        pluto = elt_data.get("staging", {}).get("pluto", pd.DataFrame())
+        sales = elt_data.get("property_valuations", pd.DataFrame())
+        permits = elt_data.get("staging", {}).get("permits", None)
+        violations = elt_data.get("staging", {}).get("violations", None)
 
     if sales.empty:
         logger.warning("No sales data available for feature engineering")
@@ -126,7 +170,11 @@ def step_features(elt_data: dict = None):
     return featured_df
 
 
-def step_models(featured_df: pd.DataFrame = None, macro_df: pd.DataFrame = None):
+def step_models(
+    featured_df: pd.DataFrame = None,
+    macro_df: pd.DataFrame = None,
+    violations_df: pd.DataFrame = None,
+):
     """Step 4: Model Training."""
     logger.info("=" * 60)
     logger.info("STEP 4: MODEL TRAINING")
@@ -149,6 +197,11 @@ def step_models(featured_df: pd.DataFrame = None, macro_df: pd.DataFrame = None)
         macro_path = DATA_PROCESSED / "macro_economic.parquet"
         if macro_path.exists():
             macro_df = pd.read_parquet(macro_path)
+
+    if violations_df is None:
+        violations_path = DATA_PROCESSED / "staging_violations.parquet"
+        if violations_path.exists():
+            violations_df = pd.read_parquet(violations_path)
 
     results = {}
 
@@ -177,6 +230,10 @@ def step_models(featured_df: pd.DataFrame = None, macro_df: pd.DataFrame = None)
                 # Gradient Boosting for accuracy
                 gb_results = hedonic.fit_gradient_boosting(reg_df)
                 results["hedonic_gb"] = gb_results
+
+                # Stacked ensemble for stronger predictive performance
+                stacked_results = hedonic.fit_stacked_ensemble(reg_df)
+                results["hedonic_stacked"] = stacked_results
 
                 hedonic.save()
             else:
@@ -245,7 +302,7 @@ def step_models(featured_df: pd.DataFrame = None, macro_df: pd.DataFrame = None)
         distress = DistressPredictor()
 
         # Create labels
-        labeled_df = distress.create_distress_labels(featured_df)
+        labeled_df = distress.create_distress_labels(featured_df, violations_df=violations_df)
 
         if labeled_df["is_distressed"].sum() > 20:
             distress_results = distress.fit(labeled_df)
@@ -262,6 +319,16 @@ def step_models(featured_df: pd.DataFrame = None, macro_df: pd.DataFrame = None)
             logger.warning("Insufficient distress cases for modeling")
     except Exception as e:
         logger.error(f"Distress predictor failed: {e}")
+
+    # ── 4e: Automated reporting (figures + html) ──
+    try:
+        from src.reporting.model_reports import ModelReportGenerator
+
+        report_generator = ModelReportGenerator()
+        report_artifacts = report_generator.generate(results, featured_df)
+        results["model_report"] = report_artifacts
+    except Exception as e:
+        logger.error(f"Model report generation failed: {e}")
 
     return results
 
@@ -380,16 +447,62 @@ def main():
         action="store_true",
         help="Use demo data instead of live API calls",
     )
+    parser.add_argument(
+        "--data-scale",
+        choices=sorted(DATA_SCALE_PROFILES.keys()),
+        default=DEFAULT_DATA_SCALE,
+        help=f"Data volume profile (default: {DEFAULT_DATA_SCALE})",
+    )
+    parser.add_argument(
+        "--demo-size",
+        type=int,
+        default=DEMO_SAMPLE_SIZE,
+        help=f"Demo sample size for synthetic data (default: {DEMO_SAMPLE_SIZE})",
+    )
+    parser.add_argument("--limit-pluto", type=int, default=None, help="Override PLUTO fetch limit")
+    parser.add_argument(
+        "--limit-sales",
+        type=int,
+        default=None,
+        help="Override rolling sales fetch limit",
+    )
+    parser.add_argument(
+        "--limit-permits",
+        type=int,
+        default=None,
+        help="Override DOB permits fetch limit",
+    )
+    parser.add_argument(
+        "--limit-violations",
+        type=int,
+        default=None,
+        help="Override HPD violations fetch limit",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
+    fetch_limits = _resolve_fetch_limits(
+        data_scale=args.data_scale,
+        limit_pluto=args.limit_pluto,
+        limit_sales=args.limit_sales,
+        limit_permits=args.limit_permits,
+        limit_violations=args.limit_violations,
+    )
     logger.info("🏢 NYC CRE Investment Analytics Pipeline")
-    logger.info(f"   Step: {args.step} | Demo mode: {args.demo}")
+    logger.info(
+        f"   Step: {args.step} | Demo mode: {args.demo} | "
+        f"Data scale: {args.data_scale}"
+    )
+    logger.info(f"   Effective fetch limits: {fetch_limits}")
     logger.info("=" * 60)
 
     try:
         if args.step in ["acquire", "all"]:
-            raw_data = step_acquire(use_demo=args.demo)
+            raw_data = step_acquire(
+                use_demo=args.demo,
+                fetch_limits=fetch_limits,
+                demo_size=max(args.demo_size, 1000),
+            )
         else:
             raw_data = None
 
@@ -407,12 +520,14 @@ def main():
         macro_path = DATA_PROCESSED / "macro_economic.parquet"
         if macro_path.exists():
             macro_df = pd.read_parquet(macro_path)
-        elif DATA_RAW / "macro_economic.parquet":
-            if (DATA_RAW / "macro_economic.parquet").exists():
-                macro_df = pd.read_parquet(DATA_RAW / "macro_economic.parquet")
+        elif (DATA_RAW / "macro_economic.parquet").exists():
+            macro_df = pd.read_parquet(DATA_RAW / "macro_economic.parquet")
 
         if args.step in ["model", "all"]:
-            model_results = step_models(featured_df, macro_df)
+            violations_for_models = None
+            if isinstance(elt_data, dict):
+                violations_for_models = elt_data.get("staging", {}).get("violations")
+            model_results = step_models(featured_df, macro_df, violations_for_models)
             logger.info(f"Model results: {list(model_results.keys())}")
 
         if args.step in ["simulate", "all"]:

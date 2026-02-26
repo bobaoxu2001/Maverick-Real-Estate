@@ -25,7 +25,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import DATA_RAW, DATA_PROCESSED, NYC_CENTER, BOROUGH_CODES
+from config import DATA_RAW, DATA_PROCESSED, REPORTS_DIR, NYC_CENTER, BOROUGH_CODES
 
 # ─────────────────────────────────────────────────────────
 # Page Configuration
@@ -90,13 +90,45 @@ def load_data():
     if not data:
         data = generate_demo_data()
 
+    if "property_valuations" in data and isinstance(data["property_valuations"], pd.DataFrame):
+        data["property_valuations"] = harmonize_property_columns(data["property_valuations"])
+
     return data
 
 
-def generate_demo_data():
+def harmonize_property_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names so demo and pipeline outputs behave consistently."""
+    if df.empty:
+        return df
+
+    out = df.copy()
+    rename_map = {
+        "yearbuilt": "year_built",
+        "numfloors": "num_floors",
+        "assesstot": "assessed_total",
+    }
+    for src, dst in rename_map.items():
+        if src in out.columns and dst not in out.columns:
+            out[dst] = out[src]
+
+    if "sale_date" in out.columns and "sale_year" not in out.columns:
+        out["sale_date"] = pd.to_datetime(out["sale_date"], errors="coerce")
+        out["sale_year"] = out["sale_date"].dt.year
+
+    if "price_per_sqft" not in out.columns and {"sale_price", "gross_square_feet"}.issubset(out.columns):
+        sale_price = pd.to_numeric(out["sale_price"], errors="coerce")
+        sqft = pd.to_numeric(out["gross_square_feet"], errors="coerce").replace(0, np.nan)
+        out["price_per_sqft"] = sale_price / sqft
+
+    if "borough_name" not in out.columns and "borough" in out.columns:
+        out["borough_name"] = pd.to_numeric(out["borough"], errors="coerce").map(BOROUGH_CODES)
+
+    return out
+
+
+def generate_demo_data(n: int = 5000):
     """Generate realistic demo data based on actual NYC CRE market characteristics."""
     np.random.seed(42)
-    n = 5000
 
     boroughs = np.random.choice(
         ["Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"],
@@ -244,6 +276,7 @@ def sidebar():
             "⚠️ Risk & Distress Analysis",
             "🎲 Monte Carlo Simulation",
             "🔗 Network Analysis",
+            "🧪 Model Diagnostics Gallery",
         ],
     )
 
@@ -302,7 +335,13 @@ def page_executive_summary(data, filters):
             avg_distress = prop_df["distress_probability"].mean() * 100
             st.metric("Avg Distress Score", f"{avg_distress:.1f}%")
         else:
-            st.metric("Avg Building Age", f"{prop_df['building_age'].mean():.0f}yr")
+            if "building_age" in prop_df.columns:
+                st.metric("Avg Building Age", f"{prop_df['building_age'].mean():.0f}yr")
+            elif "year_built" in prop_df.columns:
+                derived_age = pd.Timestamp.now().year - pd.to_numeric(prop_df["year_built"], errors="coerce")
+                st.metric("Avg Building Age", f"{derived_age.mean():.0f}yr")
+            else:
+                st.metric("Avg Building Age", "N/A")
     with col5:
         if "sale_year" in prop_df.columns:
             yoy = prop_df.groupby("sale_year")["price_per_sqft"].median()
@@ -358,15 +397,23 @@ def page_executive_summary(data, filters):
     # Borough breakdown table
     st.subheader("Borough Market Summary")
     if "borough_name" in prop_df.columns:
-        summary = prop_df.groupby("borough_name").agg({
+        agg_spec = {
             "sale_price": ["count", "mean", "median"],
             "price_per_sqft": ["mean", "median"],
-            "building_age": "mean",
-        }).round(0)
-        summary.columns = [
-            "# Sales", "Avg Price", "Median Price",
-            "Avg $/SF", "Median $/SF", "Avg Age",
-        ]
+        }
+        if "building_age" in prop_df.columns:
+            agg_spec["building_age"] = "mean"
+        summary = prop_df.groupby("borough_name").agg(agg_spec).round(0)
+        summary.columns = ["_".join(col).strip("_") for col in summary.columns]
+        rename_map = {
+            "sale_price_count": "# Sales",
+            "sale_price_mean": "Avg Price",
+            "sale_price_median": "Median Price",
+            "price_per_sqft_mean": "Avg $/SF",
+            "price_per_sqft_median": "Median $/SF",
+            "building_age_mean": "Avg Age",
+        }
+        summary = summary.rename(columns=rename_map)
         summary = summary.sort_values("Median Price", ascending=False)
 
         # Format as currency
@@ -391,10 +438,12 @@ def page_property_map(data, filters):
         return
 
     # Color by selector
-    color_by = st.selectbox(
-        "Color properties by:",
-        ["price_per_sqft", "risk_tier", "borough_name", "cluster", "building_age"],
-    )
+    color_candidates = ["price_per_sqft", "risk_tier", "borough_name", "cluster", "building_age", "year_built"]
+    color_options = [c for c in color_candidates if c in prop_df.columns]
+    if not color_options:
+        st.warning("No suitable columns available for map coloring.")
+        return
+    color_by = st.selectbox("Color properties by:", color_options)
 
     # Sample for performance
     map_df = prop_df.dropna(subset=["latitude", "longitude"]).head(2000)
@@ -410,6 +459,11 @@ def page_property_map(data, filters):
         "Queens": "#2ecc71", "Bronx": "#f39c12", "Staten Island": "#9b59b6",
     }
 
+    year_col = "year_built" if "year_built" in map_df.columns else "yearbuilt"
+    if color_by not in ["risk_tier", "borough_name"]:
+        quantile_source = pd.to_numeric(prop_df[color_by], errors="coerce")
+        q75 = quantile_source.quantile(0.75)
+        q50 = quantile_source.quantile(0.50)
     for _, row in map_df.iterrows():
         lat, lon = row.get("latitude"), row.get("longitude")
         if pd.isna(lat) or pd.isna(lon):
@@ -421,16 +475,18 @@ def page_property_map(data, filters):
         <b>$/SF:</b> ${row.get('price_per_sqft', 0):,.0f}<br>
         <b>Borough:</b> {row.get('borough_name', 'N/A')}<br>
         <b>Neighborhood:</b> {row.get('neighborhood', 'N/A')}<br>
-        <b>Year Built:</b> {row.get('year_built', 'N/A')}<br>
+        <b>Year Built:</b> {row.get(year_col, 'N/A')}<br>
         """
 
         if color_by in ["risk_tier", "borough_name"]:
             color = color_map.get(str(row.get(color_by, "")), "blue")
         else:
-            val = float(row.get(color_by, 0) or 0)
-            if val > prop_df[color_by].quantile(0.75):
+            val = pd.to_numeric(pd.Series([row.get(color_by)]), errors="coerce").iloc[0]
+            if pd.isna(val):
+                color = "gray"
+            elif val > q75:
                 color = "red"
-            elif val > prop_df[color_by].quantile(0.5):
+            elif val > q50:
                 color = "orange"
             else:
                 color = "green"
@@ -448,17 +504,21 @@ def page_property_map(data, filters):
 
     # Scatter plot: Price vs Size
     st.subheader("Price vs. Property Size")
-    fig = px.scatter(
-        prop_df.head(3000),
-        x="gross_square_feet",
-        y="sale_price",
-        color="borough_name",
-        size="num_floors",
-        hover_data=["neighborhood", "price_per_sqft"],
-        log_x=True,
-        log_y=True,
-        color_discrete_sequence=px.colors.qualitative.Set2,
-    )
+    size_col = "num_floors" if "num_floors" in prop_df.columns else ("numfloors" if "numfloors" in prop_df.columns else None)
+    scatter_kwargs = {
+        "data_frame": prop_df.head(3000),
+        "x": "gross_square_feet",
+        "y": "sale_price",
+        "hover_data": ["neighborhood", "price_per_sqft"] if "neighborhood" in prop_df.columns else ["price_per_sqft"],
+        "log_x": True,
+        "log_y": True,
+        "color_discrete_sequence": px.colors.qualitative.Set2,
+    }
+    if "borough_name" in prop_df.columns:
+        scatter_kwargs["color"] = "borough_name"
+    if size_col:
+        scatter_kwargs["size"] = size_col
+    fig = px.scatter(**scatter_kwargs)
     fig.update_layout(height=500, xaxis_title="Gross Square Feet (log)", yaxis_title="Sale Price (log)")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -535,11 +595,13 @@ def page_market_trends(data, filters):
     # Year-over-year changes
     st.subheader("Annual Market Metrics")
     if "sale_year" in prop_df.columns:
-        annual = prop_df.groupby("sale_year").agg({
+        annual_agg = {
             "sale_price": "median",
             "price_per_sqft": "median",
-            "building_age": "mean",
-        }).reset_index()
+        }
+        if "building_age" in prop_df.columns:
+            annual_agg["building_age"] = "mean"
+        annual = prop_df.groupby("sale_year").agg(annual_agg).reset_index()
 
         annual["price_yoy"] = annual["price_per_sqft"].pct_change() * 100
 
@@ -731,10 +793,10 @@ def page_risk_analysis(data, filters):
 
     # High-risk property list
     st.subheader("Top High-Risk Properties")
-    high_risk_df = prop_df.nlargest(20, "distress_probability")[
-        ["neighborhood", "borough_name", "sale_price", "price_per_sqft",
-         "building_age", "distress_probability", "risk_tier"]
-    ].copy()
+    risk_cols = ["neighborhood", "borough_name", "sale_price", "price_per_sqft", "distress_probability", "risk_tier"]
+    if "building_age" in prop_df.columns:
+        risk_cols.insert(4, "building_age")
+    high_risk_df = prop_df.nlargest(20, "distress_probability")[risk_cols].copy()
     high_risk_df["sale_price"] = high_risk_df["sale_price"].apply(lambda x: f"${x:,.0f}")
     high_risk_df["distress_probability"] = high_risk_df["distress_probability"].apply(lambda x: f"{x:.1%}")
     st.dataframe(high_risk_df, use_container_width=True)
@@ -951,6 +1013,48 @@ def page_network(data, filters):
 
 
 # ─────────────────────────────────────────────────────────
+# Page: Model Diagnostics Gallery
+# ─────────────────────────────────────────────────────────
+def page_model_diagnostics():
+    st.header("🧪 Model Diagnostics Gallery")
+    st.markdown(
+        "Automatically generated visuals and model evaluation artifacts from the latest pipeline run."
+    )
+
+    report_root = REPORTS_DIR / "model_performance"
+    if not report_root.exists():
+        st.info("No model reports found yet. Run: `python run_pipeline.py --step model --demo`")
+        return
+
+    report_dirs = sorted([p for p in report_root.iterdir() if p.is_dir()], reverse=True)
+    if not report_dirs:
+        st.info("No model reports found yet. Run a model step first.")
+        return
+
+    latest_report = report_dirs[0]
+    st.caption(f"Latest report folder: `{latest_report}`")
+
+    metrics_path = latest_report / "model_metrics.csv"
+    if metrics_path.exists():
+        metrics_df = pd.read_csv(metrics_path)
+        st.subheader("Model Metrics")
+        st.dataframe(metrics_df, use_container_width=True)
+
+    figures_dir = latest_report / "figures"
+    if figures_dir.exists():
+        images = sorted(figures_dir.glob("*.png"))
+        if images:
+            st.subheader("Generated Figures")
+            for img in images:
+                st.markdown(f"**{img.stem.replace('_', ' ').title()}**")
+                st.image(str(img), use_container_width=True)
+
+    html_report = latest_report / "report.html"
+    if html_report.exists():
+        st.markdown(f"Full HTML report: `{html_report}`")
+
+
+# ─────────────────────────────────────────────────────────
 # Utility Functions
 # ─────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -995,6 +1099,8 @@ def main():
         page_simulation(data, filters)
     elif page == "🔗 Network Analysis":
         page_network(data, filters)
+    elif page == "🧪 Model Diagnostics Gallery":
+        page_model_diagnostics()
 
 
 if __name__ == "__main__":
