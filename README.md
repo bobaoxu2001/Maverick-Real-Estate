@@ -14,7 +14,7 @@ This project demonstrates a production-grade data science pipeline for commercia
 
 | Capability | Description | Technique |
 |---|---|---|
-| **Property Valuation** | Hedonic regression decomposing value into constituent features | OLS, Ridge, Gradient Boosting |
+| **Property Valuation** | Hedonic regression decomposing value into constituent features | OLS, Ridge, Gradient Boosting, Stacked Ensemble |
 | **Market Segmentation** | Unsupervised clustering of properties and neighborhoods | K-Means, DBSCAN, PCA |
 | **Price Forecasting** | Time series modeling of market trends with macro variables | SARIMAX, Prophet |
 | **Distress Prediction** | Probability of financial distress / forced sale | XGBoost with calibrated probabilities |
@@ -110,6 +110,9 @@ nyc-cre-investment-analytics/
 │   ├── elt_pipeline.py                # ELT: staging → intermediate → marts
 │   ├── feature_engineering.py         # Geospatial, property, market features
 │   ├── graph_analysis.py              # Neo4j-compatible network analysis
+│   ├── reporting/
+│   │   ├── __init__.py
+│   │   └── model_reports.py           # HTML + PNG performance report generator
 │   └── models/
 │       ├── hedonic_regression.py      # Property valuation (OLS/Ridge/GBM)
 │       ├── property_clustering.py     # Market segmentation (K-Means/DBSCAN)
@@ -127,12 +130,15 @@ nyc-cre-investment-analytics/
 ├── app/
 │   └── dashboard.py                   # Streamlit interactive dashboard
 │
+├── docs/
+│   └── data_dictionary.md             # Data schema + business glossary
+│
 ├── data/
 │   ├── raw/                           # API-fetched data (parquet)
 │   └── processed/                     # Pipeline output (parquet)
 │
 ├── models/                            # Saved model artifacts (joblib)
-└── reports/                           # Generated reports and logs
+└── reports/                           # Logs + model performance reports
 ```
 
 ---
@@ -252,6 +258,12 @@ cp .env.example .env
 # Full pipeline with live API data
 python run_pipeline.py
 
+# Larger professional-scale pull (more rows from APIs)
+python run_pipeline.py --data-scale professional
+
+# Institutional-scale pull (largest preset)
+python run_pipeline.py --data-scale institutional
+
 # Demo mode (no API keys required — uses realistic generated data)
 python run_pipeline.py --demo
 
@@ -259,6 +271,9 @@ python run_pipeline.py --demo
 python run_pipeline.py --step acquire    # Fetch data only
 python run_pipeline.py --step model      # Train models only
 python run_pipeline.py --step simulate   # Run simulations only
+
+# Optional: customize raw pull limits directly
+python run_pipeline.py --step acquire --limit-pluto 200000 --limit-sales 250000
 ```
 
 ### Launch Dashboard
@@ -275,6 +290,16 @@ The dashboard opens at `http://localhost:8501` with interactive visualizations:
 - Risk heatmaps and distress scoring
 - Monte Carlo fan charts and scenario tables
 - Network analysis and Neo4j integration preview
+- Model diagnostics gallery from generated report figures
+
+---
+
+## Professional Enhancements (Maverick-style)
+
+- **More data**: configurable acquisition profiles (`quick`, `professional`, `institutional`) with higher default limits and full pagination.
+- **Better models**: hedonic stack ensemble (Ridge + Gradient Boosting + Random Forest) for stronger predictive performance.
+- **More visuals**: automated reporting pipeline outputs model leaderboard, feature-importance charts, and market diagnostics images.
+- **Professional artifacts**: timestamped HTML report bundles in `reports/model_performance/` and project data dictionary in `docs/data_dictionary.md`.
 
 ---
 

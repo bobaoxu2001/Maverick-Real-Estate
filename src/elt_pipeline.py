@@ -298,11 +298,17 @@ def run_elt_pipeline(raw_data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFram
     if "macro_economic" in raw_data:
         results["macro_economic"] = raw_data["macro_economic"]
 
+    # Save staging tables for downstream standalone steps
+    for stage_name, stage_df in stg.items():
+        stage_path = DATA_PROCESSED / f"staging_{stage_name}.parquet"
+        stage_df.to_parquet(stage_path, index=False)
+        logger.info(f"Saved staging_{stage_name} → {stage_path}")
+
     # Save processed data
     for name, df in results.items():
         if isinstance(df, pd.DataFrame):
             path = DATA_PROCESSED / f"{name}.parquet"
-            df.to_parquet(path, index=True)
+            df.to_parquet(path, index=isinstance(df.index, pd.DatetimeIndex))
             logger.info(f"Saved {name} → {path}")
 
     logger.info("ELT Pipeline complete!")

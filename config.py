@@ -9,6 +9,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_int(name: str, default: int) -> int:
+    """Parse a positive integer from environment variables."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except ValueError:
+        return default
+
 # ──────────────────────────────────────────────
 # Paths
 # ──────────────────────────────────────────────
@@ -16,9 +28,10 @@ PROJECT_ROOT = Path(__file__).parent
 DATA_RAW = PROJECT_ROOT / "data" / "raw"
 DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
 REPORTS_DIR = PROJECT_ROOT / "reports"
+REPORTS_MODEL_DIR = REPORTS_DIR / "model_performance"
 MODEL_ARTIFACTS = PROJECT_ROOT / "models"
 
-for d in [DATA_RAW, DATA_PROCESSED, REPORTS_DIR, MODEL_ARTIFACTS]:
+for d in [DATA_RAW, DATA_PROCESSED, REPORTS_DIR, REPORTS_MODEL_DIR, MODEL_ARTIFACTS]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ──────────────────────────────────────────────
@@ -43,6 +56,49 @@ DATASETS = {
     # MapPLUTO (geospatial) — lot boundaries with land use
     "mappluto": "evjd-dqpz",
 }
+
+# Data scale presets (Socrata API supports pagination, so limits may exceed 50k)
+DATA_SCALE_PROFILES = {
+    "quick": {
+        "pluto": 50000,
+        "rolling_sales": 50000,
+        "dob_permits": 30000,
+        "hpd_violations": 30000,
+    },
+    "professional": {
+        "pluto": 150000,
+        "rolling_sales": 150000,
+        "dob_permits": 100000,
+        "hpd_violations": 100000,
+    },
+    "institutional": {
+        "pluto": 250000,
+        "rolling_sales": 300000,
+        "dob_permits": 200000,
+        "hpd_violations": 200000,
+    },
+}
+DEFAULT_DATA_SCALE = os.getenv("DATA_SCALE", "professional").lower()
+if DEFAULT_DATA_SCALE not in DATA_SCALE_PROFILES:
+    DEFAULT_DATA_SCALE = "professional"
+
+DATA_FETCH_LIMITS = {
+    "pluto": _env_int("LIMIT_PLUTO", DATA_SCALE_PROFILES[DEFAULT_DATA_SCALE]["pluto"]),
+    "rolling_sales": _env_int(
+        "LIMIT_ROLLING_SALES",
+        DATA_SCALE_PROFILES[DEFAULT_DATA_SCALE]["rolling_sales"],
+    ),
+    "dob_permits": _env_int(
+        "LIMIT_DOB_PERMITS",
+        DATA_SCALE_PROFILES[DEFAULT_DATA_SCALE]["dob_permits"],
+    ),
+    "hpd_violations": _env_int(
+        "LIMIT_HPD_VIOLATIONS",
+        DATA_SCALE_PROFILES[DEFAULT_DATA_SCALE]["hpd_violations"],
+    ),
+}
+DEMO_SAMPLE_SIZE = _env_int("DEMO_SAMPLE_SIZE", 12000)
+MACRO_START_DATE = os.getenv("MACRO_START_DATE", "2005-01-01")
 
 # ──────────────────────────────────────────────
 # FRED API  (Federal Reserve Economic Data)

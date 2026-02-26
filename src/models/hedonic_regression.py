@@ -23,9 +23,9 @@ import numpy as np
 import pandas as pd
 import joblib
 from loguru import logger
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.linear_model import Ridge, Lasso, ElasticNet
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
@@ -75,6 +75,8 @@ class HedonicRegressionModel:
     def __init__(self, params: dict = None):
         self.params = params or MODEL_PARAMS["hedonic_regression"]
         self.pipeline = None
+        self.gb_pipeline = None
+        self.stacked_pipeline = None
         self.ols_model = None
         self.feature_names = []
         self.results = {}
@@ -311,15 +313,140 @@ class HedonicRegressionModel:
 
         return self.results["gradient_boosting"]
 
+    def fit_stacked_ensemble(self, df: pd.DataFrame) -> dict:
+        """Fit stacked ensemble for higher predictive accuracy.
+
+        Base learners:
+          - Ridge (stable linear signal)
+          - Gradient Boosting (non-linear interactions)
+          - Random Forest (robust non-parametric fit)
+        Meta learner:
+          - Linear regression over out-of-fold base predictions
+        """
+        X, y = self._prepare_data(df)
+
+        mask = y.notna() & X.notna().all(axis=1)
+        X_clean = X[mask]
+        y_clean = y[mask]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_clean,
+            y_clean,
+            test_size=self.params["test_size"],
+            random_state=self.params["random_state"],
+        )
+
+        estimators = [
+            (
+                "ridge",
+                Pipeline(
+                    [
+                        ("scaler", StandardScaler()),
+                        ("model", Ridge(alpha=1.0)),
+                    ]
+                ),
+            ),
+            (
+                "gbr",
+                GradientBoostingRegressor(
+                    n_estimators=400,
+                    max_depth=4,
+                    learning_rate=0.05,
+                    subsample=0.85,
+                    random_state=self.params["random_state"],
+                ),
+            ),
+            (
+                "rf",
+                RandomForestRegressor(
+                    n_estimators=400,
+                    min_samples_leaf=3,
+                    random_state=self.params["random_state"],
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+
+        stack_pipeline = Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "stacker",
+                    StackingRegressor(
+                        estimators=estimators,
+                        final_estimator=LinearRegression(),
+                        cv=self.params["cv_folds"],
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+        stack_pipeline.fit(X_train, y_train)
+
+        y_pred_train = stack_pipeline.predict(X_train)
+        y_pred_test = stack_pipeline.predict(X_test)
+
+        stacker = stack_pipeline.named_steps["stacker"]
+        gbr_imp = stacker.named_estimators_["gbr"].feature_importances_
+        rf_imp = stacker.named_estimators_["rf"].feature_importances_
+        blended_imp = (gbr_imp + rf_imp) / 2.0
+        feature_importance = dict(
+            sorted(
+                dict(zip(self.feature_names, blended_imp)).items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+        )
+        meta_weights = dict(
+            zip(
+                [name for name, _ in estimators],
+                stacker.final_estimator_.coef_.tolist(),
+            )
+        )
+
+        self.results["stacked_ensemble"] = {
+            "train_r2": r2_score(y_train, y_pred_train),
+            "test_r2": r2_score(y_test, y_pred_test),
+            "test_rmse": np.sqrt(mean_squared_error(y_test, y_pred_test)),
+            "test_mae": mean_absolute_error(y_test, y_pred_test),
+            "test_mape": mean_absolute_percentage_error(
+                np.expm1(y_test),
+                np.expm1(y_pred_test),
+            ),
+            "meta_weights": meta_weights,
+            "feature_importance": feature_importance,
+            "n_train": len(X_train),
+            "n_test": len(X_test),
+        }
+        self.stacked_pipeline = stack_pipeline
+
+        logger.info(
+            "Stacked Ensemble: Test R²="
+            f"{self.results['stacked_ensemble']['test_r2']:.4f}, "
+            f"MAPE={self.results['stacked_ensemble']['test_mape']:.1%}"
+        )
+        logger.info(
+            f"Stacked top 5 features: {list(feature_importance.keys())[:5]}"
+        )
+        return self.results["stacked_ensemble"]
+
     def predict_value(self, property_features: pd.DataFrame) -> pd.Series:
         """Predict property values using the best fitted model.
 
         Returns predictions in actual dollar values (not log scale).
         """
-        if self.pipeline is None and not hasattr(self, "gb_pipeline"):
-            raise ValueError("No model fitted. Call fit_regularized() or fit_gradient_boosting() first.")
+        if self.pipeline is None and self.gb_pipeline is None and self.stacked_pipeline is None:
+            raise ValueError(
+                "No model fitted. Call fit_regularized(), fit_gradient_boosting(), "
+                "or fit_stacked_ensemble() first."
+            )
 
-        model = getattr(self, "gb_pipeline", self.pipeline)
+        if self.stacked_pipeline is not None:
+            model = self.stacked_pipeline
+        elif self.gb_pipeline is not None:
+            model = self.gb_pipeline
+        else:
+            model = self.pipeline
         X = property_features[self.feature_names].copy()
         for col in X.columns:
             X[col] = pd.to_numeric(X[col], errors="coerce")
@@ -354,6 +481,8 @@ class HedonicRegressionModel:
         path = path or MODEL_ARTIFACTS / "hedonic_regression.joblib"
         joblib.dump({
             "pipeline": self.pipeline,
+            "gb_pipeline": self.gb_pipeline,
+            "stacked_pipeline": self.stacked_pipeline,
             "ols_model": self.ols_model,
             "feature_names": self.feature_names,
             "results": self.results,
@@ -365,6 +494,8 @@ class HedonicRegressionModel:
         path = path or MODEL_ARTIFACTS / "hedonic_regression.joblib"
         artifacts = joblib.load(path)
         self.pipeline = artifacts["pipeline"]
+        self.gb_pipeline = artifacts.get("gb_pipeline")
+        self.stacked_pipeline = artifacts.get("stacked_pipeline")
         self.ols_model = artifacts["ols_model"]
         self.feature_names = artifacts["feature_names"]
         self.results = artifacts["results"]

@@ -15,14 +15,13 @@ Author: Allen Xu
 
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import cdist
 from sklearn.preprocessing import (
     StandardScaler,
     LabelEncoder,
-    OneHotEncoder,
 )
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import KFold
 from loguru import logger
 
 import sys
@@ -194,19 +193,25 @@ def add_market_context_features(
             df["neighborhood_permit_activity"] = df["neighborhood_permit_activity"].fillna(0)
 
     # Violation rate (distress signal)
-    if violations_df is not None and "boroid" in violations_df.columns:
-        if "borough" in df.columns:
+    if violations_df is not None:
+        boro_col = None
+        for candidate in ["boroid", "boroughid"]:
+            if candidate in violations_df.columns:
+                boro_col = candidate
+                break
+
+        if boro_col and "borough" in df.columns:
             violation_counts = (
-                violations_df.groupby("boroid")
+                violations_df.groupby(boro_col)
                 .size()
                 .reset_index(name="borough_violation_count")
             )
-            violation_counts["boroid"] = violation_counts["boroid"].astype(str)
+            violation_counts[boro_col] = violation_counts[boro_col].astype(str)
             df["borough"] = df["borough"].astype(str)
             df = df.merge(
                 violation_counts,
                 left_on="borough",
-                right_on="boroid",
+                right_on=boro_col,
                 how="left",
             )
             df["borough_violation_count"] = df["borough_violation_count"].fillna(0)
@@ -256,18 +261,34 @@ def encode_categoricals(
                 encoders[col] = le
                 logger.debug(f"Label encoded: {col}")
 
-    # Target encoding (mean encoding with smoothing)
+    # Target encoding (OOF mean encoding with smoothing to reduce leakage)
     if target_encode_cols and target_col in df.columns:
         global_mean = df[target_col].mean()
         smoothing = 10
+        n_splits = min(5, len(df))
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42) if n_splits >= 2 else None
 
         for col in target_encode_cols:
             if col in df.columns:
-                agg = df.groupby(col)[target_col].agg(["mean", "count"])
-                smooth = (agg["count"] * agg["mean"] + smoothing * global_mean) / (
-                    agg["count"] + smoothing
+                encoded = pd.Series(index=df.index, dtype=float)
+                # Out-of-fold encoding for training rows
+                if kf is not None:
+                    for train_idx, valid_idx in kf.split(df):
+                        train_fold = df.iloc[train_idx]
+                        valid_keys = df.iloc[valid_idx][col]
+                        agg = train_fold.groupby(col)[target_col].agg(["mean", "count"])
+                        smooth = (agg["count"] * agg["mean"] + smoothing * global_mean) / (
+                            agg["count"] + smoothing
+                        )
+                        encoded.iloc[valid_idx] = valid_keys.map(smooth).fillna(global_mean).values
+
+                # Store a global map too (useful for future scoring pipelines)
+                agg_full = df.groupby(col)[target_col].agg(["mean", "count"])
+                smooth_full = (agg_full["count"] * agg_full["mean"] + smoothing * global_mean) / (
+                    agg_full["count"] + smoothing
                 )
-                df[f"{col}_target_encoded"] = df[col].map(smooth)
+                df[f"{col}_target_encoded"] = encoded.fillna(global_mean)
+                df[f"{col}_target_encoded_global"] = df[col].map(smooth_full).fillna(global_mean)
                 logger.debug(f"Target encoded: {col}")
 
     return df
